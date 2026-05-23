@@ -32,6 +32,8 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
 URL_RE = re.compile(r"https?://\S+")
+TIKTOK_PHOTO_RE = re.compile(r"tiktok\.com/@[^/?#]+/photo/(\d+)")
+TIKTOK_SHORT_RE = re.compile(r"(?:vt|vm)\.tiktok\.com/\w+")
 MAX_FILE_SIZE = 49 * 1024 * 1024
 TOKEN_TTL = 600  # секунд до видалення невикористаного токена
 DOWNLOAD_TOKENS: dict[str, tuple[str, dict | None, float]] = {}  # token -> (url, info, timestamp)
@@ -78,6 +80,99 @@ RATE_LIMIT_MSG = (
 
 def _is_rate_limit(exc: Exception) -> bool:
     return "429" in str(exc) or "Too Many Requests" in str(exc)
+
+
+def _resolve_url(url: str) -> str:
+    """Follow HTTP redirects and return the final URL (best-effort)."""
+    try:
+        if _IMPERSONATE:
+            from curl_cffi import requests as cffi_req
+            resp = cffi_req.get(url, impersonate="chrome116", allow_redirects=True, timeout=10)
+            return resp.url
+        else:
+            import urllib.request
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible)"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.url
+    except Exception as exc:
+        logger.warning("URL resolution failed for %s: %s", url, exc)
+        return url
+
+
+def _get_tiktok_photos(url: str) -> tuple[list[str], dict]:
+    """Fetch image URLs for a TikTok photo/slideshow post via internal web API."""
+    m = TIKTOK_PHOTO_RE.search(url)
+    if not m:
+        raise ValueError("Not a TikTok photo URL")
+    item_id = m.group(1)
+
+    api_url = (
+        f"https://www.tiktok.com/api/item/detail/"
+        f"?itemId={item_id}&aid=1988&app_language=en&device_platform=web_pc"
+    )
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://www.tiktok.com/",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    import json as _json
+    if _IMPERSONATE:
+        from curl_cffi import requests as cffi_req
+        resp = cffi_req.get(api_url, headers=headers, impersonate="chrome116", timeout=15)
+        data = resp.json()
+    else:
+        import urllib.request
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = _json.loads(resp.read().decode())
+
+    item = data.get("itemInfo", {}).get("itemStruct", {})
+    if not item:
+        raise ValueError("TikTok API повернув порожню відповідь")
+
+    title = (item.get("desc") or "TikTok фото").strip()
+    uploader = (item.get("author") or {}).get("nickname") or ""
+
+    image_urls: list[str] = []
+    for raw in (item.get("imagePost") or {}).get("images") or []:
+        url_list = (raw.get("imageURL") or {}).get("urlList") or []
+        if url_list:
+            image_urls.append(url_list[0])
+
+    if not image_urls:
+        raise ValueError("У цьому пості не знайдено зображень")
+
+    return image_urls, {"title": title, "uploader": uploader}
+
+
+def _download_images(image_urls: list[str], target_dir: Path) -> list[Path]:
+    """Download a list of image URLs into target_dir."""
+    dl_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://www.tiktok.com/",
+    }
+    paths: list[Path] = []
+    for i, img_url in enumerate(image_urls):
+        dest = target_dir / f"photo_{i + 1:02d}.jpg"
+        if _IMPERSONATE:
+            from curl_cffi import requests as cffi_req
+            r = cffi_req.get(img_url, headers=dl_headers, impersonate="chrome116", timeout=30)
+            dest.write_bytes(r.content)
+        else:
+            import urllib.request
+            req = urllib.request.Request(img_url, headers=dl_headers)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                dest.write_bytes(r.read())
+        paths.append(dest)
+    return paths
 
 
 def _retry(fn, *args, retries: int = 3):
@@ -202,6 +297,28 @@ async def run_sync(fn, *args):
     return await loop.run_in_executor(None, partial(fn, *args))
 
 
+async def send_photo_album(
+    message: types.Message,
+    paths: list[Path],
+    caption: str,
+) -> None:
+    """Send images as Telegram media group (≤10 per chunk)."""
+    from aiogram.types import InputMediaPhoto
+
+    await bot.send_chat_action(message.chat.id, "upload_photo")
+    for chunk_start in range(0, len(paths), 10):
+        chunk = paths[chunk_start : chunk_start + 10]
+        media = [
+            InputMediaPhoto(
+                media=FSInputFile(p),
+                caption=caption if i == 0 and chunk_start == 0 else None,
+                parse_mode="HTML" if i == 0 and chunk_start == 0 else None,
+            )
+            for i, p in enumerate(chunk)
+        ]
+        await message.answer_media_group(media=media)
+
+
 async def send_media(
     message: types.Message,
     path: Path,
@@ -308,6 +425,44 @@ async def url_handler(message: types.Message) -> None:
 
     _cleanup_tokens()
     status = await message.answer("🔍 Отримую інформацію...")
+
+    # Resolve short TikTok links (vt.tiktok.com / vm.tiktok.com) before checking URL type
+    resolved_url = url
+    if TIKTOK_SHORT_RE.search(url):
+        resolved_url = await run_sync(_resolve_url, url)
+
+    # TikTok photo/slideshow posts are unsupported by yt-dlp — use custom handler
+    if TIKTOK_PHOTO_RE.search(resolved_url):
+        try:
+            image_urls, photo_info = await run_sync(_get_tiktok_photos, resolved_url)
+        except Exception:
+            logger.exception("TikTok photo fetch failed url=%s", resolved_url)
+            await status.edit_text("Не вдалося отримати фото. Перевірте посилання.")
+            return
+
+        await status.edit_text("⏳ Завантажую фото...")
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                paths = await run_sync(_download_images, image_urls, Path(tmp))
+            except Exception:
+                logger.exception("TikTok photo download failed url=%s", resolved_url)
+                await status.edit_text("Помилка завантаження фото.")
+                return
+
+            title = html.escape(photo_info.get("title") or "TikTok фото")
+            uploader = html.escape(photo_info.get("uploader") or "")
+            caption = f"<b>{title}</b>" + (f"\nАвтор: {uploader}" if uploader else "")
+
+            await status.edit_text("📤 Надсилаю фото...")
+            try:
+                await send_photo_album(message, paths, caption)
+            except Exception:
+                logger.exception("Send photo album failed url=%s", resolved_url)
+                await status.edit_text("Не вдалося надіслати фото.")
+                return
+
+        await status.delete()
+        return
 
     try:
         info = await run_sync(_get_info, url)
