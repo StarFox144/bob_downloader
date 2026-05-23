@@ -1,0 +1,6 @@
+aiogram==3.0.0b5
+yt-dlp>=2024.12.15
+python-dotenv>=1.0.0
+curl_cffi>=0.10.0,<0.15.0
+mutagen>=1.47.0
+static-ffmpeg>=2.5
