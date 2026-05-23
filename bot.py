@@ -53,7 +53,13 @@ except ImportError:
     _IMPERSONATE = {}
     logger.warning("curl_cffi not installed — TikTok may fail with 403/429")
 
-YDL_COMMON = {"quiet": True, "no_warnings": True, **_IMPERSONATE}
+YDL_COMMON = {
+    "quiet": True,
+    "no_warnings": True,
+    **_IMPERSONATE,
+    # iOS client bypasses YouTube bot-detection on most videos
+    "extractor_args": {"youtube": {"player_client": ["ios"]}},
+}
 
 _BOT_DIR = Path(__file__).parent
 
@@ -65,6 +71,16 @@ def _load_cookie_opts() -> dict:
     return {}
 
 _COOKIE_OPTS = _load_cookie_opts()
+
+YOUTUBE_BOT_MSG = (
+    "YouTube заблокував запит через захист від ботів.\n\n"
+    "<b>Як виправити:</b>\n"
+    "1. Встанови розширення <b>«Get cookies.txt LOCALLY»</b> у Chrome/Edge\n"
+    "2. Залогінься на youtube.com\n"
+    "3. Натисни розширення → Export → збережи файл як <code>cookies.txt</code> "
+    "у папку бота (<code>C:\\Users\\Roman\\bob_downloader\\</code>)\n"
+    "4. Перезапусти бота"
+)
 
 RATE_LIMIT_MSG = (
     "TikTok тимчасово заблокував запит (429 Too Many Requests).\n\n"
@@ -80,6 +96,11 @@ RATE_LIMIT_MSG = (
 
 def _is_rate_limit(exc: Exception) -> bool:
     return "429" in str(exc) or "Too Many Requests" in str(exc)
+
+
+def _is_youtube_bot_error(exc: Exception) -> bool:
+    msg = str(exc)
+    return "Sign in to confirm" in msg or ("bot" in msg.lower() and "youtube" in msg.lower())
 
 
 def _resolve_url(url: str) -> str:
@@ -100,46 +121,73 @@ def _resolve_url(url: str) -> str:
 
 
 def _get_tiktok_photos(url: str) -> tuple[list[str], dict]:
-    """Fetch image URLs for a TikTok photo/slideshow post via internal web API."""
-    m = TIKTOK_PHOTO_RE.search(url)
-    if not m:
+    """Fetch image URLs for a TikTok photo/slideshow post by scraping the page HTML."""
+    if not TIKTOK_PHOTO_RE.search(url):
         raise ValueError("Not a TikTok photo URL")
-    item_id = m.group(1)
 
-    api_url = (
-        f"https://www.tiktok.com/api/item/detail/"
-        f"?itemId={item_id}&aid=1988&app_language=en&device_platform=web_pc"
-    )
-    headers = {
+    # Strip tracking query params for a clean page fetch
+    page_url = url.split("?")[0]
+
+    fetch_headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
         ),
-        "Referer": "https://www.tiktok.com/",
-        "Accept": "application/json, text/plain, */*",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.tiktok.com/",
     }
 
-    import json as _json
     if _IMPERSONATE:
         from curl_cffi import requests as cffi_req
-        resp = cffi_req.get(api_url, headers=headers, impersonate="chrome116", timeout=15)
-        data = resp.json()
+        resp = cffi_req.get(page_url, headers=fetch_headers, impersonate="chrome116", timeout=20)
+        html = resp.text
     else:
         import urllib.request
-        req = urllib.request.Request(api_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = _json.loads(resp.read().decode())
+        req = urllib.request.Request(page_url, headers=fetch_headers)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            html = r.read().decode("utf-8", errors="replace")
 
-    item = data.get("itemInfo", {}).get("itemStruct", {})
-    if not item:
-        raise ValueError("TikTok API повернув порожню відповідь")
+    import json as _json
 
-    title = (item.get("desc") or "TikTok фото").strip()
-    uploader = (item.get("author") or {}).get("nickname") or ""
+    # TikTok embeds post data in a <script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"> tag
+    def _extract_script(script_id: str) -> dict | None:
+        marker = f'id="{script_id}"'
+        idx = html.find(marker)
+        if idx == -1:
+            return None
+        content_start = html.find(">", idx) + 1
+        content_end = html.find("</script>", content_start)
+        try:
+            return _json.loads(html[content_start:content_end].strip())
+        except Exception:
+            return None
+
+    item_struct: dict = {}
+
+    data = _extract_script("__UNIVERSAL_DATA_FOR_REHYDRATION__")
+    if data:
+        item_struct = (
+            data.get("__DEFAULT_SCOPE__", {})
+                .get("webapp.video-detail", {})
+                .get("itemInfo", {})
+                .get("itemStruct", {})
+        )
+
+    if not item_struct:
+        data = _extract_script("SIGI_STATE")
+        if data:
+            item_module = data.get("ItemModule", {})
+            item_struct = next(iter(item_module.values()), {}) if item_module else {}
+
+    if not item_struct:
+        raise ValueError("Не вдалося знайти дані про пост на сторінці TikTok")
+
+    title = (item_struct.get("desc") or "TikTok фото").strip()
+    uploader = (item_struct.get("author") or {}).get("nickname") or ""
 
     image_urls: list[str] = []
-    for raw in (item.get("imagePost") or {}).get("images") or []:
+    for raw in (item_struct.get("imagePost") or {}).get("images") or []:
         url_list = (raw.get("imageURL") or {}).get("urlList") or []
         if url_list:
             image_urls.append(url_list[0])
@@ -470,6 +518,8 @@ async def url_handler(message: types.Message) -> None:
         logger.exception("Info extraction failed url=%s", url)
         if _is_rate_limit(e):
             await status.edit_text(RATE_LIMIT_MSG, parse_mode="HTML")
+        elif _is_youtube_bot_error(e):
+            await status.edit_text(YOUTUBE_BOT_MSG, parse_mode="HTML")
         else:
             await status.edit_text("Не вдалося отримати інформацію. Перевірте посилання.")
         return
