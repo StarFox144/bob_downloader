@@ -58,8 +58,8 @@ _YT_RE = re.compile(r"youtube\.com|youtu\.be|youtube music", re.I)
 YDL_COMMON = {
     "quiet": True,
     "no_warnings": True,
-    # tv_embedded client avoids YouTube bot-detection on datacenter IPs better than ios
-    "extractor_args": {"youtube": {"player_client": ["tv_embedded", "ios"]}},
+    # web client with valid cookies bypasses bot-detection; tv_embedded as backup (no format restrictions on bot side)
+    "extractor_args": {"youtube": {"player_client": ["web", "tv_embedded", "ios"]}},
 }
 
 def _ydl_opts(url: str, **extra) -> dict:
@@ -215,9 +215,15 @@ def _tiktok_api(item_id: str, cookie_str: str) -> tuple[list[str], dict] | None:
         if _IMPERSONATE:
             from curl_cffi import requests as cffi_req
             resp = cffi_req.get(api_url, headers=headers, impersonate="chrome120", timeout=15)
+            logger.info("TikTok API: status=%d size=%d", resp.status_code, len(resp.content))
             if not resp.content:
+                logger.warning("TikTok API: empty response body (status=%d)", resp.status_code)
                 return None
-            data = resp.json()
+            try:
+                data = resp.json()
+            except Exception:
+                logger.warning("TikTok API: non-JSON response (status=%d): %r", resp.status_code, resp.text[:300])
+                return None
         else:
             import urllib.request, json as _j
             req = urllib.request.Request(api_url, headers=headers)
@@ -394,7 +400,8 @@ def extract_url(text: str) -> str | None:
 
 
 def _get_info(url: str) -> dict:
-    opts = _ydl_opts(url, skip_download=True)
+    # "best" is permissive enough for tv_embedded fallback which has limited formats
+    opts = _ydl_opts(url, skip_download=True, format="best")
 
     def _extract():
         with YoutubeDL(opts) as ydl:
