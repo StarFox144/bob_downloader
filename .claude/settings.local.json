@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(Test-Path \"C:\\\\Users\\\\Roman\\\\bob_downloader\\\\cookies.txt\")"
-    ]
-  }
-}
