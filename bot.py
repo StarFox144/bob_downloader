@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 static_ffmpeg.add_paths()  # додає ffmpeg/ffprobe в PATH якщо не знайдено системного
 
-load_dotenv()
+load_dotenv(override=True)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN:
