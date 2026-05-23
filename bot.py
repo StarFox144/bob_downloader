@@ -63,12 +63,28 @@ YDL_COMMON = {
 
 _BOT_DIR = Path(__file__).parent
 
-# Cookies читаються один раз при запуску
+# Cookies читаються один раз при запуску; якщо є кілька файлів — об'єднуються в один
 def _load_cookie_opts() -> dict:
-    for p in _BOT_DIR.glob("*cookies*.txt"):
-        logger.info("Using cookies file: %s", p.name)
-        return {"cookiefile": str(p)}
-    return {}
+    files = [p for p in _BOT_DIR.glob("*cookies*.txt") if not p.name.startswith("_combined")]
+    if not files:
+        return {}
+    if len(files) == 1:
+        logger.info("Using cookies file: %s", files[0].name)
+        return {"cookiefile": str(files[0])}
+
+    combined = _BOT_DIR / "_combined_cookies.txt"
+    lines = ["# Netscape HTTP Cookie File\n"]
+    for p in files:
+        logger.info("Merging cookies file: %s", p.name)
+        try:
+            for line in p.read_text(encoding="utf-8").splitlines():
+                if line and not line.startswith("#"):
+                    lines.append(line + "\n")
+        except Exception as exc:
+            logger.warning("Could not read %s: %s", p.name, exc)
+    combined.write_text("".join(lines), encoding="utf-8")
+    logger.info("Combined %d cookie files → %s", len(files), combined.name)
+    return {"cookiefile": str(combined)}
 
 _COOKIE_OPTS = _load_cookie_opts()
 
