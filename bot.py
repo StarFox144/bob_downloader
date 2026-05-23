@@ -63,6 +63,21 @@ YDL_COMMON = {
 
 _BOT_DIR = Path(__file__).parent
 
+# Підтримка cookies через env-змінну COOKIES_B64 (base64) — для Railway/Docker-деплоїв
+def _init_env_cookies() -> None:
+    raw = os.getenv("COOKIES_B64", "").strip()
+    if not raw:
+        return
+    import base64
+    dest = _BOT_DIR / "env_cookies.txt"
+    try:
+        dest.write_bytes(base64.b64decode(raw))
+        logger.info("Cookies loaded from COOKIES_B64 env var → %s", dest.name)
+    except Exception as exc:
+        logger.warning("Failed to decode COOKIES_B64: %s", exc)
+
+_init_env_cookies()
+
 # Cookies читаються один раз при запуску; якщо є кілька файлів — об'єднуються в один
 def _load_cookie_opts() -> dict:
     files = [p for p in _BOT_DIR.glob("*cookies*.txt") if not p.name.startswith("_combined")]
@@ -87,6 +102,22 @@ def _load_cookie_opts() -> dict:
     return {"cookiefile": str(combined)}
 
 _COOKIE_OPTS = _load_cookie_opts()
+
+
+def _read_cookies_for_domain(domain: str) -> str:
+    """Return Cookie header string for the given domain from the loaded cookie file."""
+    cookiefile = _COOKIE_OPTS.get("cookiefile")
+    if not cookiefile:
+        return ""
+    try:
+        import http.cookiejar
+        jar = http.cookiejar.MozillaCookieJar(cookiefile)
+        jar.load(ignore_discard=True, ignore_expires=True)
+        cookies = {c.name: c.value for c in jar if domain in (c.domain or "")}
+        return "; ".join(f"{k}={v}" for k, v in cookies.items())
+    except Exception as exc:
+        logger.debug("Failed to read cookies for %s: %s", domain, exc)
+        return ""
 
 YOUTUBE_BOT_MSG = (
     "YouTube заблокував запит через захист від ботів.\n\n"
@@ -147,17 +178,32 @@ def _get_tiktok_photos(url: str) -> tuple[list[str], dict]:
     fetch_headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.tiktok.com/",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "max-age=0",
+        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
     }
+
+    cookie_str = _read_cookies_for_domain("tiktok.com")
+    if cookie_str:
+        fetch_headers["Cookie"] = cookie_str
 
     if _IMPERSONATE:
         from curl_cffi import requests as cffi_req
-        resp = cffi_req.get(page_url, headers=fetch_headers, impersonate="chrome116", timeout=20)
+        resp = cffi_req.get(page_url, headers=fetch_headers, impersonate="chrome120", timeout=20)
         html = resp.text
+        logger.info("TikTok page fetch: status=%d len=%d cookies=%s",
+                    resp.status_code, len(html), "yes" if cookie_str else "no")
     else:
         import urllib.request
         req = urllib.request.Request(page_url, headers=fetch_headers)
@@ -197,6 +243,7 @@ def _get_tiktok_photos(url: str) -> tuple[list[str], dict]:
             item_struct = next(iter(item_module.values()), {}) if item_module else {}
 
     if not item_struct:
+        logger.warning("TikTok page snippet (first 500 chars): %r", html[:500])
         raise ValueError("Не вдалося знайти дані про пост на сторінці TikTok")
 
     title = (item_struct.get("desc") or "TikTok фото").strip()
