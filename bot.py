@@ -71,8 +71,16 @@ def _init_env_cookies() -> None:
     import base64
     dest = _BOT_DIR / "env_cookies.txt"
     try:
-        dest.write_bytes(base64.b64decode(raw))
-        logger.info("Cookies loaded from COOKIES_B64 env var → %s", dest.name)
+        decoded = base64.b64decode("".join(raw.split()))  # strip whitespace Railway might add
+        # Decode to text with multiple fallbacks, then write clean UTF-8 for yt-dlp
+        for enc in ("utf-8-sig", "utf-8", "utf-16", "latin-1"):
+            try:
+                content = decoded.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        dest.write_text(content, encoding="utf-8")
+        logger.info("Cookies loaded from COOKIES_B64 env var → %s (%d bytes)", dest.name, len(decoded))
     except Exception as exc:
         logger.warning("Failed to decode COOKIES_B64: %s", exc)
 
@@ -114,9 +122,10 @@ def _read_cookies_for_domain(domain: str) -> str:
         jar = http.cookiejar.MozillaCookieJar(cookiefile)
         jar.load(ignore_discard=True, ignore_expires=True)
         cookies = {c.name: c.value for c in jar if domain in (c.domain or "")}
+        logger.debug("Cookies for %s: %d found", domain, len(cookies))
         return "; ".join(f"{k}={v}" for k, v in cookies.items())
     except Exception as exc:
-        logger.debug("Failed to read cookies for %s: %s", domain, exc)
+        logger.warning("_read_cookies_for_domain(%s) failed: %s", domain, exc)
         return ""
 
 YOUTUBE_BOT_MSG = (
@@ -167,12 +176,71 @@ def _resolve_url(url: str) -> str:
         return url
 
 
-def _get_tiktok_photos(url: str) -> tuple[list[str], dict]:
-    """Fetch image URLs for a TikTok photo/slideshow post by scraping the page HTML."""
-    if not TIKTOK_PHOTO_RE.search(url):
-        raise ValueError("Not a TikTok photo URL")
+def _tiktok_api(item_id: str, cookie_str: str) -> tuple[list[str], dict] | None:
+    """Try TikTok web API endpoint. Returns None if response has no image data."""
+    import json as _json
 
-    # Strip tracking query params for a clean page fetch
+    api_url = (
+        f"https://www.tiktok.com/api/item/detail/"
+        f"?itemId={item_id}&aid=1988&app_language=en&app_name=tiktok_web"
+        f"&device_platform=web_pc&language=en&region=US"
+    )
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.tiktok.com/",
+    }
+    if cookie_str:
+        headers["Cookie"] = cookie_str
+
+    try:
+        if _IMPERSONATE:
+            from curl_cffi import requests as cffi_req
+            resp = cffi_req.get(api_url, headers=headers, impersonate="chrome120", timeout=15)
+            if not resp.content:
+                return None
+            data = resp.json()
+        else:
+            import urllib.request, json as _j
+            req = urllib.request.Request(api_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = _j.loads(r.read().decode())
+    except Exception as exc:
+        logger.debug("TikTok API call failed: %s", exc)
+        return None
+
+    item = data.get("itemInfo", {}).get("itemStruct", {})
+    if not item:
+        logger.debug("TikTok API: empty itemStruct (status=%s)", data.get("statusCode"))
+        return None
+
+    title = (item.get("desc") or "TikTok фото").strip()
+    uploader = (item.get("author") or {}).get("nickname") or ""
+
+    image_urls: list[str] = []
+    for raw in (item.get("imagePost") or {}).get("images") or []:
+        url_list = (raw.get("imageURL") or {}).get("urlList") or []
+        if url_list:
+            image_urls.append(url_list[0])
+
+    return (image_urls, {"title": title, "uploader": uploader}) if image_urls else None
+
+
+def _get_tiktok_photos(url: str) -> tuple[list[str], dict]:
+    """Fetch image URLs for a TikTok photo/slideshow post."""
+    m = TIKTOK_PHOTO_RE.search(url)
+    if not m:
+        raise ValueError("Not a TikTok photo URL")
+    item_id = m.group(1)
+
+    # Try API first — works from server IPs when valid session cookies are provided
+    cookie_str = _read_cookies_for_domain("tiktok.com")
+    api_result = _tiktok_api(item_id, cookie_str)
+    if api_result:
+        logger.info("TikTok API succeeded for item %s", item_id)
+        return api_result
+
+    # Fallback: page scraping (works when TikTok serves SSR HTML)
     page_url = url.split("?")[0]
 
     fetch_headers = {
@@ -194,7 +262,6 @@ def _get_tiktok_photos(url: str) -> tuple[list[str], dict]:
         "Upgrade-Insecure-Requests": "1",
     }
 
-    cookie_str = _read_cookies_for_domain("tiktok.com")
     if cookie_str:
         fetch_headers["Cookie"] = cookie_str
 
