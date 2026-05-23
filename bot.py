@@ -206,12 +206,13 @@ def _tiktok_api(item_id: str, cookie_str: str) -> tuple[list[str], dict] | None:
             with urllib.request.urlopen(req, timeout=15) as r:
                 data = _j.loads(r.read().decode())
     except Exception as exc:
-        logger.debug("TikTok API call failed: %s", exc)
+        logger.warning("TikTok API call failed: %s", exc)
         return None
 
     item = data.get("itemInfo", {}).get("itemStruct", {})
     if not item:
-        logger.debug("TikTok API: empty itemStruct (status=%s)", data.get("statusCode"))
+        logger.warning("TikTok API: empty itemStruct (statusCode=%s keys=%s)",
+                       data.get("statusCode"), list(data.keys())[:6])
         return None
 
     title = (item.get("desc") or "TikTok фото").strip()
