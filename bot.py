@@ -53,13 +53,22 @@ except ImportError:
     _IMPERSONATE = {}
     logger.warning("curl_cffi not installed — TikTok may fail with 403/429")
 
+_YT_RE = re.compile(r"youtube\.com|youtu\.be|youtube music", re.I)
+
 YDL_COMMON = {
     "quiet": True,
     "no_warnings": True,
-    **_IMPERSONATE,
-    # iOS client bypasses YouTube bot-detection on most videos
-    "extractor_args": {"youtube": {"player_client": ["ios"]}},
+    # tv_embedded client avoids YouTube bot-detection on datacenter IPs better than ios
+    "extractor_args": {"youtube": {"player_client": ["tv_embedded", "ios"]}},
 }
+
+def _ydl_opts(url: str, **extra) -> dict:
+    """Return yt-dlp options for the URL, only adding impersonation for non-YouTube."""
+    opts = {**YDL_COMMON, **_COOKIE_OPTS}
+    if _IMPERSONATE and not _YT_RE.search(url):
+        opts.update(_IMPERSONATE)
+    opts.update(extra)
+    return opts
 
 _BOT_DIR = Path(__file__).parent
 
@@ -180,10 +189,19 @@ def _tiktok_api(item_id: str, cookie_str: str) -> tuple[list[str], dict] | None:
     """Try TikTok web API endpoint. Returns None if response has no image data."""
     import json as _json
 
+    # Extract msToken from cookie string if present (needed as query param)
+    ms_token = ""
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if part.startswith("msToken="):
+            ms_token = part[len("msToken="):]
+            break
+
     api_url = (
         f"https://www.tiktok.com/api/item/detail/"
         f"?itemId={item_id}&aid=1988&app_language=en&app_name=tiktok_web"
         f"&device_platform=web_pc&language=en&region=US"
+        + (f"&msToken={ms_token}" if ms_token else "")
     )
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -211,8 +229,8 @@ def _tiktok_api(item_id: str, cookie_str: str) -> tuple[list[str], dict] | None:
 
     item = data.get("itemInfo", {}).get("itemStruct", {})
     if not item:
-        logger.warning("TikTok API: empty itemStruct (statusCode=%s keys=%s)",
-                       data.get("statusCode"), list(data.keys())[:6])
+        logger.warning("TikTok API: empty itemStruct (statusCode=%s msToken=%s keys=%s)",
+                       data.get("statusCode"), bool(ms_token), list(data.keys())[:6])
         return None
 
     title = (item.get("desc") or "TikTok фото").strip()
@@ -376,7 +394,7 @@ def extract_url(text: str) -> str | None:
 
 
 def _get_info(url: str) -> dict:
-    opts = {**YDL_COMMON, **_COOKIE_OPTS, "skip_download": True}
+    opts = _ydl_opts(url, skip_download=True)
 
     def _extract():
         with YoutubeDL(opts) as ydl:
@@ -393,26 +411,22 @@ def _get_info(url: str) -> dict:
 
 def _download(url: str, mode: str, quality: str, target_dir: Path) -> Path:
     if mode == "audio":
-        ydl_opts = {
-            **YDL_COMMON,
-            **_COOKIE_OPTS,
-            "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
-            "outtmpl": str(target_dir / "%(title).180s.%(ext)s"),
-            "writethumbnail": True,
-            "postprocessors": [
+        ydl_opts = _ydl_opts(url,
+            format="bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
+            outtmpl=str(target_dir / "%(title).180s.%(ext)s"),
+            writethumbnail=True,
+            postprocessors=[
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "320"},
                 {"key": "FFmpegMetadata", "add_metadata": True},
                 {"key": "EmbedThumbnail"},
             ],
-        }
+        )
     else:
-        ydl_opts = {
-            **YDL_COMMON,
-            **_COOKIE_OPTS,
-            "format": QUALITY_FORMATS.get(quality, QUALITY_FORMATS["best"]),
-            "outtmpl": str(target_dir / "%(title).180s.%(ext)s"),
-            "merge_output_format": "mp4",
-        }
+        ydl_opts = _ydl_opts(url,
+            format=QUALITY_FORMATS.get(quality, QUALITY_FORMATS["best"]),
+            outtmpl=str(target_dir / "%(title).180s.%(ext)s"),
+            merge_output_format="mp4",
+        )
 
     def _do():
         with YoutubeDL(ydl_opts) as ydl:
